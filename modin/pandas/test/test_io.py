@@ -40,6 +40,7 @@ from modin.utils import to_pandas
 from modin.pandas.utils import from_arrow
 from modin.test.test_utils import warns_that_defaulting_to_pandas
 import pyarrow as pa
+import fastparquet
 import os
 from scipy import sparse
 import sys
@@ -1364,6 +1365,36 @@ class TestParquet:
                 columns=columns,
             )
 
+    @pytest.mark.parametrize(
+        "filters",
+        [None, [], [("col1", "==", 5)], [("col1", "<=", 215), ("col2", ">=", 35)]],
+    )
+    def test_read_parquet_filters(self, engine, make_parquet_file, filters):
+        if engine == "pyarrow" and filters == []:
+            # pyarrow, and therefore pandas using pyarrow, errors in this case.
+            # Modin correctly replicates this behavior; however error cases
+            # cause race conditions with ensure_clean on Windows.
+            # TODO: Remove this once https://github.com/modin-project/modin/issues/6460 is fixed.
+            pytest.xfail(
+                "Skipping empty filters error case to avoid race condition - see #6460"
+            )
+
+        with ensure_clean(".parquet") as unique_filename:
+            make_parquet_file(filename=unique_filename, row_group_size=100)
+
+            def comparator(df1, df2):
+                df_equals(df1, df2)
+                df_equals(df1.dtypes, df2.dtypes)
+
+            eval_io(
+                fn_name="read_parquet",
+                # read_parquet kwargs
+                engine=engine,
+                path=unique_filename,
+                filters=filters,
+                comparator=comparator,
+            )
+
     @pytest.mark.xfail(
         condition="config.getoption('--simulate-cloud').lower() != 'off'",
         reason="The reason of tests fail in `cloud` mode is unknown for now - issue #3264",
@@ -1429,8 +1460,12 @@ class TestParquet:
         condition="config.getoption('--simulate-cloud').lower() != 'off'",
         reason="The reason of tests fail in `cloud` mode is unknown for now - issue #3264",
     )
+    @pytest.mark.parametrize(
+        "filters",
+        [None, [], [("col1", "==", 5)], [("col1", "<=", 215), ("col2", ">=", 35)]],
+    )
     def test_read_parquet_partitioned_directory(
-        self, make_parquet_file, columns, engine
+        self, make_parquet_file, columns, filters, engine
     ):
         with ensure_clean_dir() as dirname:
             unique_filename = get_unique_filename(extension=None, data_dir=dirname)
@@ -1442,13 +1477,28 @@ class TestParquet:
                 engine=engine,
                 path=unique_filename,
                 columns=columns,
+                filters=filters,
             )
 
     @pytest.mark.xfail(
         condition="config.getoption('--simulate-cloud').lower() != 'off'",
         reason="The reason of tests fail in `cloud` mode is unknown for now - issue #3264",
     )
-    def test_read_parquet_pandas_index(self, engine):
+    @pytest.mark.parametrize(
+        "filters",
+        [
+            None,
+            [],
+            [("B", "==", "a")],
+            [
+                ("B", "==", "a"),
+                ("A", ">=", 50_000),
+                ("idx", "<=", 30_000),
+                ("idx_categorical", "==", "y"),
+            ],
+        ],
+    )
+    def test_read_parquet_pandas_index(self, engine, filters):
         # Ensure modin can read parquet files written by pandas with a non-RangeIndex object
         pandas_df = pandas.DataFrame(
             {
@@ -1483,6 +1533,18 @@ class TestParquet:
 
         for col in pandas_df.columns:
             if col.startswith("idx"):
+                # Before this commit, first released in version 2023.1.0, fastparquet relied
+                # on pandas private APIs to handle Categorical indices.
+                # These private APIs broke in pandas 2.
+                # https://github.com/dask/fastparquet/commit/cf60ae0e9a9ca57afc7a8da98d8c0423db1c0c53
+                if (
+                    col == "idx_categorical"
+                    and engine == "fastparquet"
+                    and version.parse(fastparquet.__version__)
+                    < version.parse("2023.1.0")
+                ):
+                    continue
+
                 with ensure_clean(".parquet") as unique_filename:
                     pandas_df.set_index(col).to_parquet(unique_filename)
                     # read the same parquet using modin.pandas
@@ -1491,6 +1553,7 @@ class TestParquet:
                         # read_parquet kwargs
                         path=unique_filename,
                         engine=engine,
+                        filters=filters,
                     )
 
         with ensure_clean(".parquet") as unique_filename:
@@ -1500,13 +1563,23 @@ class TestParquet:
                 # read_parquet kwargs
                 path=unique_filename,
                 engine=engine,
+                filters=filters,
             )
 
     @pytest.mark.xfail(
         condition="config.getoption('--simulate-cloud').lower() != 'off'",
         reason="The reason of tests fail in `cloud` mode is unknown for now - issue #3264",
     )
-    def test_read_parquet_pandas_index_partitioned(self, engine):
+    @pytest.mark.parametrize(
+        "filters",
+        [
+            None,
+            [],
+            [("B", "==", "a")],
+            [("B", "==", "a"), ("A", ">=", 5), ("idx", "<=", 30_000)],
+        ],
+    )
+    def test_read_parquet_pandas_index_partitioned(self, engine, filters):
         # Ensure modin can read parquet files written by pandas with a non-RangeIndex object
         pandas_df = pandas.DataFrame(
             {
@@ -1525,6 +1598,7 @@ class TestParquet:
                 # read_parquet kwargs
                 path=unique_filename,
                 engine=engine,
+                filters=filters,
             )
 
     @pytest.mark.xfail(
@@ -1574,7 +1648,11 @@ class TestParquet:
         condition="config.getoption('--simulate-cloud').lower() != 'off'",
         reason="The reason of tests fail in `cloud` mode is unknown for now - issue #3264",
     )
-    def test_read_parquet_without_metadata(self, engine):
+    @pytest.mark.parametrize(
+        "filters",
+        [None, [], [("idx", "<=", 30_000)], [("idx", "<=", 30_000), ("A", ">=", 5)]],
+    )
+    def test_read_parquet_without_metadata(self, engine, filters):
         """Test that Modin can read parquet files not written by pandas."""
         from pyarrow import csv
         from pyarrow import parquet
@@ -1600,6 +1678,7 @@ class TestParquet:
                 # read_parquet kwargs
                 path=parquet_fname,
                 engine=engine,
+                filters=filters,
             )
 
     def test_read_empty_parquet_file(self, engine):
